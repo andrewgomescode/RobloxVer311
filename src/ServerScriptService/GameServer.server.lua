@@ -11,12 +11,16 @@ local LeaderboardStore = DataStoreService:GetOrderedDataStore("Leaderboard_v1")
 local CardDatabase = require(ReplicatedStorage.Modules.CardDatabase)
 local GachaSystem = require(ReplicatedStorage.Modules.GachaSystem)
 local InventoryManager = require(ReplicatedStorage.Modules.InventoryManager)
-local VersusSystem = require(ReplicatedStorage.Modules.VersusSystem)
-local VersionManager = require(ReplicatedStorage.Modules.VersionManager)
 
--- Remote Events/Functions
-local RemoteEvents = ReplicatedStorage.RemoteEvents
-local RemoteFunctions = ReplicatedStorage.RemoteFunctions
+-- Initialize RemoteEvents system
+local RemoteEventsModule = require(ReplicatedStorage.RemoteEvents)
+local RemoteEvents = RemoteEventsModule.Events
+local RemoteFunctions = RemoteEventsModule.Functions
+
+-- Connect GachaSystem's GetPlayerInventory to our cache
+GachaSystem.GetPlayerInventory = function(self, player)
+	return playerDataCache[player.UserId]
+end
 
 -- Player data cache
 local playerDataCache = {}
@@ -81,14 +85,7 @@ local function loadPlayerData(player)
 	if success and data then
 		-- Migrate old boosterPacks format to new packs format
 		data = InventoryManager:MigrateOldFormat(data)
-
-		-- Migrate data if needed
-		local migratedData, error = VersionManager:MigrateData(data)
-		if migratedData then
-			return migratedData
-		else
-			warn("Migration failed for player " .. player.Name .. ": " .. error)
-		end
+		return data
 	end
 
 	-- Return new inventory if no data or migration failed
@@ -188,18 +185,17 @@ Players.PlayerAdded:Connect(function(player)
 			end
 
 		elseif command == "/pack" then
-			local packType = args[2]
-			local amount = tonumber(args[3]) or 1
+			local amount = tonumber(args[2]) or 1
 
 			local inventory = playerDataCache[player.UserId]
-			if inventory and GachaSystem.BoosterPacks[packType] then
-				inventory.boosterPacks[packType] = (inventory.boosterPacks[packType] or 0) + amount
+			if inventory then
+				inventory.packs = (inventory.packs or 0) + amount
 
 				-- Notify player
-				RemoteEvents.UpdateInventory:FireClient(player, inventory, "Added " .. amount .. " " .. packType .. " pack(s)")
-				print("Added " .. amount .. " " .. packType .. " pack(s) to " .. player.Name)
+				RemoteEvents.UpdateInventory:FireClient(player, inventory, "Added " .. amount .. " pack(s)")
+				print("Added " .. amount .. " pack(s) to " .. player.Name)
 			else
-				print("Usage: /pack [Basic/Premium/Ultimate] [amount]")
+				print("Usage: /pack [amount]")
 			end
 
 		elseif command == "/card" then
@@ -238,7 +234,7 @@ Players.PlayerAdded:Connect(function(player)
 		elseif command == "/help" then
 			print("=== ADMIN COMMANDS ===")
 			print("/currency [amount] - Add currency")
-			print("/pack [Basic/Premium/Ultimate] [amount] - Add packs")
+			print("/pack [amount] - Add packs")
 			print("/card [cardId] [amount] - Add specific cards")
 			print("/reset - Reset inventory to default")
 			print("/help - Show this help")
@@ -273,9 +269,43 @@ end
 RemoteFunctions.GetCardCollection.OnServerInvoke = function(player)
 	local inventory = playerDataCache[player.UserId]
 	if inventory then
-		return InventoryManager:GetSortedCards(inventory, "rarity")
+		local cardData = InventoryManager:FilterCards(inventory, InventoryManager.FilterType.ALL)
+		return InventoryManager:SortCards(cardData, InventoryManager.SortType.RARITY, false)
 	end
 	return {}
+end
+
+-- Additional RemoteFunctions for the new system
+RemoteFunctions.GetInventoryStats.OnServerInvoke = function(player)
+	local inventory = playerDataCache[player.UserId]
+	if inventory then
+		return InventoryManager:GetInventoryStats(inventory)
+	end
+	return nil
+end
+
+RemoteFunctions.GetCardDetails.OnServerInvoke = function(player, cardId)
+	return CardDatabase:GetCardById(cardId)
+end
+
+RemoteFunctions.GetGachaStats.OnServerInvoke = function(player)
+	return GachaSystem:GetGachaStats(player)
+end
+
+RemoteFunctions.GetGachaConfig.OnServerInvoke = function(player)
+	return GachaSystem:GetGachaConfig()
+end
+
+RemoteFunctions.CanAffordPacks.OnServerInvoke = function(player, quantity)
+	return GachaSystem:CanAffordPacks(player, quantity)
+end
+
+RemoteFunctions.ValidateCard.OnServerInvoke = function(player, cardId)
+	return CardDatabase:IsValidCard(cardId)
+end
+
+RemoteFunctions.GetCardDatabase.OnServerInvoke = function(player)
+	return CardDatabase:GetAllCards()
 end
 
 -- Remote Events (Updated for new pack system)
@@ -291,21 +321,15 @@ RemoteEvents.PurchaseBoosterPack.OnServerEvent:Connect(function(player, quantity
 	local inventory = playerDataCache[player.UserId]
 	if not inventory then return end
 
-	local totalCost = GachaSystem.StandardPack.cost * quantity
-
-	if inventory.currency < totalCost then
-		RemoteEvents.UpdateInventory:FireClient(player, inventory, "Insufficient currency")
-		return
+	local success, message = GachaSystem:PurchasePacks(player, quantity)
+	
+	if success then
+		-- Update leaderstats
+		player.leaderstats.Currency.Value = inventory.currency
+		RemoteEvents.UpdateInventory:FireClient(player, inventory, quantity .. " pack(s) purchased!")
+	else
+		RemoteEvents.UpdateInventory:FireClient(player, inventory, message)
 	end
-
-	-- Deduct currency and add packs
-	inventory.currency = inventory.currency - totalCost
-	inventory.packs = (inventory.packs or 0) + quantity
-
-	-- Update leaderstats
-	player.leaderstats.Currency.Value = inventory.currency
-
-	RemoteEvents.UpdateInventory:FireClient(player, inventory, quantity .. " pack(s) purchased!")
 end)
 
 RemoteEvents.OpenBoosterPack.OnServerEvent:Connect(function(player, quantity)
@@ -320,40 +344,23 @@ RemoteEvents.OpenBoosterPack.OnServerEvent:Connect(function(player, quantity)
 	local inventory = playerDataCache[player.UserId]
 	if not inventory then return end
 
-	-- Check if player has enough packs (NEW FORMAT)
+	-- Check if player has enough packs
 	local packsOwned = inventory.packs or 0
 	if packsOwned < quantity then
 		RemoteEvents.UpdateInventory:FireClient(player, inventory, "Not enough packs")
 		return
 	end
 
-	-- Open packs using the new simplified gacha system
-	local allCards = {}
-	for i = 1, quantity do
-		local cards, error = GachaSystem:OpenBoosterPack(player)
-		if cards then
-			for _, card in ipairs(cards) do
-				table.insert(allCards, card)
-			end
-		end
-	end
-
-	if #allCards == 0 then
-		RemoteEvents.UpdateInventory:FireClient(player, inventory, "Failed to open pack")
+	-- Open packs using the new gacha system
+	local allCards, error = GachaSystem:OpenBoosterPack(player, quantity)
+	
+	if not allCards or #allCards == 0 then
+		RemoteEvents.UpdateInventory:FireClient(player, inventory, error or "Failed to open pack")
 		return
 	end
 
 	-- Deduct packs
 	inventory.packs = inventory.packs - quantity
-
-	-- Add cards to inventory
-	local addedCards = {}
-	for _, card in ipairs(allCards) do
-		local success, msg = InventoryManager:AddCard(inventory, card.id)
-		if success then
-			table.insert(addedCards, card)
-		end
-	end
 
 	-- Update card count
 	local count = 0
@@ -362,5 +369,5 @@ RemoteEvents.OpenBoosterPack.OnServerEvent:Connect(function(player, quantity)
 	end
 	player.leaderstats.Cards.Value = count
 
-	RemoteEvents.UpdateInventory:FireClient(player, inventory, "Pack opened!", addedCards)
+	RemoteEvents.UpdateInventory:FireClient(player, inventory, "Pack opened!", allCards)
 end)
